@@ -1,5 +1,6 @@
 // Real workspace contract for memory engine foundation concerns.
 
+export { computeSharedScopeHash } from "../../../src/agents/memory-search.js";
 export {
   resolveAgentDir,
   resolveAgentWorkspaceDir,

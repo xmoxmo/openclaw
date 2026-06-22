@@ -10,10 +10,12 @@ import {
   getMemoryMultimodalExtensions,
 } from "openclaw/plugin-sdk/memory-core-host-engine-embeddings";
 import {
+  computeSharedScopeHash,
   createSubsystemLogger,
   onSessionTranscriptUpdate,
   resolveAgentDir,
   resolveSessionTranscriptsDirForAgent,
+  resolveStateDir,
   resolveUserPath,
   type OpenClawConfig,
   type ResolvedMemorySearchConfig,
@@ -28,11 +30,13 @@ import {
   buildFileEntry,
   ensureDir,
   ensureMemoryIndexSchema,
+  ensureRegistrySchema,
   hashText,
   isFileMissingError,
   listMemoryFiles,
   loadSqliteVecExtension,
   normalizeExtraMemoryPaths,
+  registerAgentForStore,
   requireNodeSqlite,
   runWithConcurrency,
   type MemoryFileEntry,
@@ -372,6 +376,43 @@ export abstract class MemoryManagerSyncOps {
       if (this.fts.enabled) {
         log.warn(`fts unavailable: ${result.ftsError}`);
       }
+    }
+
+    // Register this agent in the shared store registry (best-effort, must never crash)
+    void this.registerSharedStore().catch(() => {});
+  }
+
+  /**
+   * Register this agent's workspace scope in the global shared-store registry.
+   * The registry tracks which agents reference which stores, enabling
+   * administrators to inspect cross-agent memory store usage.
+   *
+   * This is best-effort: failures are logged but never block startup.
+   */
+  private async registerSharedStore(): Promise<void> {
+    const stateDir = resolveStateDir(process.env);
+    const registryDir = path.join(stateDir, "memory");
+    await fs.mkdir(registryDir, { recursive: true }).catch(() => {});
+    const registryPath = path.join(registryDir, "shared-store-registry.sqlite");
+    try {
+      const { DatabaseSync } = requireNodeSqlite();
+      const registryDb = new DatabaseSync(registryPath);
+      registryDb.exec("PRAGMA busy_timeout = 5000");
+      ensureRegistrySchema(registryDb);
+
+      const scopeHash = computeSharedScopeHash(this.workspaceDir, this.settings.extraPaths);
+      const storePath = resolveUserPath(this.settings.store.path);
+      registerAgentForStore(registryDb, {
+        agentId: this.agentId,
+        dirHash: scopeHash,
+        storePath,
+        workspaceDir: this.workspaceDir,
+        extraPaths: this.settings.extraPaths,
+      });
+
+      registryDb.close();
+    } catch (err) {
+      log.warn(`shared-store registry registration failed (non-fatal): ${String(err)}`);
     }
   }
 
