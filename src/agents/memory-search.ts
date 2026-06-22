@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import type { OpenClawConfig, MemorySearchConfig } from "../config/config.js";
@@ -10,10 +11,12 @@ import {
 } from "../plugin-sdk/memory-core-host-multimodal.js";
 import { getMemoryEmbeddingProvider } from "../plugins/memory-embedding-providers.js";
 import { clampInt, clampNumber, resolveUserPath } from "../utils.js";
-import { resolveAgentConfig } from "./agent-scope.js";
+import { resolveAgentConfig, resolveAgentWorkspaceDir } from "./agent-scope.js";
 
 export type ResolvedMemorySearchConfig = {
   enabled: boolean;
+  /** Path to the shared SQLite store indexed by workspace directory hash. */
+  sharedStorePath: string;
   sources: Array<"memory" | "sessions">;
   extraPaths: string[];
   multimodal: MemoryMultimodalSettings;
@@ -137,6 +140,23 @@ function resolveStorePath(agentId: string, raw?: string): string {
   }
   const withToken = raw.includes("{agentId}") ? raw.replaceAll("{agentId}", agentId) : raw;
   return resolveUserPath(withToken);
+}
+
+/**
+ * Compute a deterministic hash from the workspace directory + extra paths.
+ * Agents sharing the same workspace + extraPaths produce the same hash
+ * and thus share the same vector store.
+ */
+export function computeSharedScopeHash(workspaceDir: string, extraPaths: string[]): string {
+  const normalizedPaths = extraPaths
+    .map((p) => resolveUserPath(p))
+    .filter(Boolean)
+    .sort();
+  const input = JSON.stringify({
+    workspace: path.resolve(workspaceDir),
+    extraPaths: normalizedPaths,
+  });
+  return crypto.createHash("sha256").update(input).digest("hex").slice(0, 16);
 }
 
 function mergeConfig(
@@ -314,6 +334,7 @@ function mergeConfig(
   const postCompactionForce = sync.sessions.postCompactionForce;
   return {
     enabled,
+    sharedStorePath: "",
     sources,
     extraPaths,
     multimodal,
@@ -376,6 +397,18 @@ export function resolveMemorySearchConfig(
   if (!resolved.enabled) {
     return null;
   }
+
+  // When memory sources are shared across agents (same workspace + extraPaths),
+  // use a shared SQLite store keyed by workspace directory hash.
+  // This eliminates redundant per-agent indexes without configuration.
+  if (resolved.sources.includes("memory")) {
+    const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
+    const scopeHash = computeSharedScopeHash(workspaceDir, resolved.extraPaths);
+    const stateDir = resolveStateDir(process.env, os.homedir);
+    resolved.sharedStorePath = path.join(stateDir, "memory", `shared-${scopeHash}.sqlite`);
+    resolved.store.path = resolved.sharedStorePath;
+  }
+
   const multimodalActive = isMemoryMultimodalEnabled(resolved.multimodal);
   const multimodalProvider =
     resolved.provider === "auto" ? undefined : getMemoryEmbeddingProvider(resolved.provider);

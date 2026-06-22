@@ -22,6 +22,24 @@ export type SearchRowResult = {
   source: SearchSource;
 };
 
+/**
+ * Build a SQL fragment to filter chunks by agent ID.
+ * Legacy chunks (empty agent_ids or NULL) are visible to all agents.
+ * Agent-scoped chunks are only visible to their owning agent.
+ */
+export function buildAgentFilter(agentId?: string): { sql: string; params: string[] } {
+  if (!agentId) {
+    return { sql: "", params: [] };
+  }
+  // Safe string matching: convert JSON array to comma-separated list without quotes,
+  // then use LIKE with comma-delimited agent ID to avoid substring collisions.
+  // E.g. ["main","orion"] → ,main,orion, → LIKE '%,agentId,%'
+  return {
+    sql: ` AND (c.agent_ids = '[]' OR c.agent_ids IS NULL OR (',' || replace(substr(c.agent_ids, 2, length(c.agent_ids) - 2), '"', '') || ',') LIKE ?)`,
+    params: [`%,${agentId},%`],
+  };
+}
+
 function escapeLikePattern(term: string): string {
   return term.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_");
 }
@@ -81,10 +99,12 @@ export async function searchVector(params: {
   ensureVectorReady: (dimensions: number) => Promise<boolean>;
   sourceFilterVec: { sql: string; params: SearchSource[] };
   sourceFilterChunks: { sql: string; params: SearchSource[] };
+  agentId?: string;
 }): Promise<SearchRowResult[]> {
   if (params.queryVec.length === 0 || params.limit <= 0) {
     return [];
   }
+  const agentFilter = buildAgentFilter(params.agentId);
   if (await params.ensureVectorReady(params.queryVec.length)) {
     const rows = params.db
       .prepare(
@@ -93,7 +113,7 @@ export async function searchVector(params: {
           `       vec_distance_cosine(v.embedding, ?) AS dist\n` +
           `  FROM ${params.vectorTable} v\n` +
           `  JOIN chunks c ON c.id = v.id\n` +
-          ` WHERE c.model = ?${params.sourceFilterVec.sql}\n` +
+          ` WHERE c.model = ?${params.sourceFilterVec.sql}${agentFilter.sql}\n` +
           ` ORDER BY dist ASC\n` +
           ` LIMIT ?`,
       )
@@ -101,6 +121,7 @@ export async function searchVector(params: {
         vectorToBlob(params.queryVec),
         params.providerModel,
         ...params.sourceFilterVec.params,
+        ...agentFilter.params,
         params.limit,
       ) as Array<{
       id: string;
@@ -126,6 +147,7 @@ export async function searchVector(params: {
     db: params.db,
     providerModel: params.providerModel,
     sourceFilter: params.sourceFilterChunks,
+    agentId: params.agentId,
   });
   const scored = candidates
     .map((chunk) => ({
@@ -151,6 +173,7 @@ export function listChunks(params: {
   db: DatabaseSync;
   providerModel: string;
   sourceFilter: { sql: string; params: SearchSource[] };
+  agentId?: string;
 }): Array<{
   id: string;
   path: string;
@@ -160,13 +183,14 @@ export function listChunks(params: {
   embedding: number[];
   source: SearchSource;
 }> {
+  const agentFilter = buildAgentFilter(params.agentId);
   const rows = params.db
     .prepare(
-      `SELECT id, path, start_line, end_line, text, embedding, source\n` +
-        `  FROM chunks\n` +
-        ` WHERE model = ?${params.sourceFilter.sql}`,
+      `SELECT c.id, c.path, c.start_line, c.end_line, c.text, c.embedding, c.source\n` +
+        `  FROM chunks c\n` +
+        ` WHERE c.model = ?${params.sourceFilter.sql}${agentFilter.sql}`,
     )
-    .all(params.providerModel, ...params.sourceFilter.params) as Array<{
+    .all(params.providerModel, ...params.sourceFilter.params, ...agentFilter.params) as Array<{
     id: string;
     path: string;
     start_line: number;
@@ -198,6 +222,7 @@ export async function searchKeyword(params: {
   sourceFilter: { sql: string; params: SearchSource[] };
   buildFtsQuery: (raw: string) => string | null;
   bm25RankToScore: (rank: number) => number;
+  agentId?: string;
 }): Promise<Array<SearchRowResult & { textScore: number }>> {
   if (params.limit <= 0) {
     return [];
@@ -212,9 +237,9 @@ export async function searchKeyword(params: {
   }
 
   // When providerModel is undefined (FTS-only mode), search all models
-  const modelClause = params.providerModel ? " AND model = ?" : "";
+  const modelClause = params.providerModel ? " AND c.model = ?" : "";
   const modelParams = params.providerModel ? [params.providerModel] : [];
-  const substringClause = plan.substringTerms.map(() => " AND text LIKE ? ESCAPE '\\'").join("");
+  const substringClause = plan.substringTerms.map(() => " AND c.text LIKE ? ESCAPE '\\'").join("");
   const substringParams = plan.substringTerms.map((term) => `%${escapeLikePattern(term)}%`);
   const whereClause = plan.matchQuery
     ? `${params.ftsTable} MATCH ?${substringClause}${modelClause}${params.sourceFilter.sql}`
@@ -228,16 +253,19 @@ export async function searchKeyword(params: {
   ];
   const rankExpression = plan.matchQuery ? `bm25(${params.ftsTable})` : "0";
 
+  // Filter by agent when searching a shared store
+  const agentFilter = buildAgentFilter(params.agentId);
   const rows = params.db
     .prepare(
-      `SELECT id, path, source, start_line, end_line, text,\n` +
+      `SELECT ${params.ftsTable}.id, ${params.ftsTable}.path, ${params.ftsTable}.source, ${params.ftsTable}.start_line, ${params.ftsTable}.end_line, ${params.ftsTable}.text,\n` +
         `       ${rankExpression} AS rank\n` +
         `  FROM ${params.ftsTable}\n` +
-        ` WHERE ${whereClause}\n` +
+        `  JOIN chunks c ON c.id = ${params.ftsTable}.id\n` +
+        ` WHERE ${whereClause}${agentFilter.sql}\n` +
         ` ORDER BY rank ASC\n` +
         ` LIMIT ?`,
     )
-    .all(...queryParams) as Array<{
+    .all(...queryParams, ...agentFilter.params) as Array<{
     id: string;
     path: string;
     source: SearchSource;

@@ -543,32 +543,71 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
     return this.batch.enabled ? this.batch.concurrency : EMBEDDING_INDEX_CONCURRENCY;
   }
 
+  /**
+   * Remove indexed data for a file scoped to the current agent.
+   * On a shared store (same workspace, multiple agents), this only
+   * clears data owned by this agent, leaving other agents' chunks intact.
+   *
+   * Strategy:
+   *   1. Chunks co-owned with other agents → remove current agent from agent_ids
+   *   2. Chunks owned only by current agent → delete entirely (incl FTS/vector)
+   *   3. Legacy chunks (empty agent_ids, from pre-shared-store migration) → delete entirely
+   */
   private clearIndexedFileData(pathname: string, source: MemorySource): void {
+    // Safe agent matching against JSON array: convert "[\"a\",\"b\"]" to ",a,b," and LIKE '%,agentId,%'
+    const safeAgentMatch = (col: string, agentId: string): string =>
+      `(',' || replace(substr(${col}, 2, max(0, length(${col}) - 2)), '"', '') || ',') LIKE ?`;
+    const agentLike = `%,${this.agentId},%`;
+    const soleOwnerJson = JSON.stringify([this.agentId]);
+    const legacyFilter = `(agent_ids = '[]' OR agent_ids IS NULL)`;
+
+    // Phase 1: Remove current agent from co-owned chunks
+    const coOwned = this.db
+      .prepare(
+        `SELECT id, agent_ids FROM chunks WHERE path = ? AND source = ? AND ${safeAgentMatch("agent_ids", this.agentId)} AND agent_ids != ?`,
+      )
+      .all(pathname, source, agentLike, soleOwnerJson) as Array<{
+      id: string;
+      agent_ids: string;
+    }>;
+    for (const chunk of coOwned) {
+      const parsed: string[] = JSON.parse(chunk.agent_ids).filter(
+        (id: string) => id !== this.agentId,
+      );
+      if (parsed.length === 0) {
+        this.db.prepare(`DELETE FROM chunks WHERE id = ?`).run(chunk.id);
+      } else {
+        this.db.prepare(`UPDATE chunks SET agent_ids = ? WHERE id = ?`).run(JSON.stringify(parsed), chunk.id);
+      }
+    }
+
+    // Phase 2: Delete chunks owned solely by this agent or legacy
+    const deleteFilter = `(agent_ids = ? OR ${legacyFilter})`;
     if (this.vector.enabled) {
       try {
         this.db
           .prepare(
-            `DELETE FROM ${VECTOR_TABLE} WHERE id IN (SELECT id FROM chunks WHERE path = ? AND source = ?)`,
+            `DELETE FROM ${VECTOR_TABLE} WHERE id IN (SELECT id FROM chunks WHERE path = ? AND source = ? AND ${deleteFilter})`,
           )
-          .run(pathname, source);
+          .run(pathname, source, soleOwnerJson);
       } catch {}
     }
     if (this.fts.enabled && this.fts.available) {
       try {
         if (this.provider) {
-          // Scoped to current model — avoids removing rows from a different model.
           this.db
-            .prepare(`DELETE FROM ${FTS_TABLE} WHERE path = ? AND source = ? AND model = ?`)
-            .run(pathname, source, this.provider.model);
+            .prepare(`DELETE FROM ${FTS_TABLE} WHERE id IN (SELECT id FROM chunks WHERE path = ? AND source = ? AND model = ? AND ${deleteFilter})`)
+            .run(pathname, source, this.provider.model, soleOwnerJson);
         } else {
-          // FTS-only: searchKeyword matches all models, so clear all to avoid stale rows.
           this.db
-            .prepare(`DELETE FROM ${FTS_TABLE} WHERE path = ? AND source = ?`)
-            .run(pathname, source);
+            .prepare(`DELETE FROM ${FTS_TABLE} WHERE id IN (SELECT id FROM chunks WHERE path = ? AND source = ? AND ${deleteFilter})`)
+            .run(pathname, source, soleOwnerJson);
         }
       } catch {}
     }
-    this.db.prepare(`DELETE FROM chunks WHERE path = ? AND source = ?`).run(pathname, source);
+    this.db
+      .prepare(`DELETE FROM chunks WHERE path = ? AND source = ? AND ${deleteFilter}`)
+      .run(pathname, source, soleOwnerJson);
   }
 
   private upsertFileRecord(entry: MemoryFileEntry | SessionFileEntry, source: MemorySource): void {
@@ -615,15 +654,34 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
       const id = hashText(
         `${source}:${entry.path}:${chunk.startLine}:${chunk.endLine}:${chunk.hash}:${model}`,
       );
+      // Shared store: read existing agent_ids and merge, so another agent's
+      // reference to the same chunk is preserved.
+      const existingRow = this.db.prepare(`SELECT agent_ids FROM chunks WHERE id = ?`).get(id) as
+        | { agent_ids: string }
+        | undefined;
+      let agentIds: string[];
+      if (existingRow) {
+        const parsed: string[] = JSON.parse(existingRow.agent_ids);
+        if (parsed.length === 0 || parsed.includes(this.agentId)) {
+          // Legacy chunk or already claimed → just claim it
+          agentIds = [this.agentId];
+        } else {
+          agentIds = [...parsed, this.agentId];
+        }
+      } else {
+        agentIds = [this.agentId];
+      }
+      const agentIdsStr = JSON.stringify(agentIds);
       this.db
         .prepare(
-          `INSERT INTO chunks (id, path, source, start_line, end_line, hash, model, text, embedding, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `INSERT INTO chunks (id, path, source, start_line, end_line, hash, model, text, embedding, agent_ids, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              hash=excluded.hash,
              model=excluded.model,
              text=excluded.text,
              embedding=excluded.embedding,
+             agent_ids=excluded.agent_ids,
              updated_at=excluded.updated_at`,
         )
         .run(
@@ -636,6 +694,7 @@ export abstract class MemoryManagerEmbeddingOps extends MemoryManagerSyncOps {
           model,
           chunk.text,
           JSON.stringify(embedding),
+          agentIdsStr,
           now,
         );
       if (vectorReady && embedding.length > 0) {

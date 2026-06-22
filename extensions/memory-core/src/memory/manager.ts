@@ -476,7 +476,8 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
       snippetMaxChars: SNIPPET_MAX_CHARS,
       ensureVectorReady: async (dimensions) => await this.ensureVectorReady(dimensions),
       sourceFilterVec: this.buildSourceFilter("c"),
-      sourceFilterChunks: this.buildSourceFilter(),
+      sourceFilterChunks: this.buildSourceFilter("c"),
+      agentId: this.agentId,
     });
     return results.map((entry) => entry as MemorySearchResult & { id: string });
   }
@@ -492,7 +493,7 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
     if (!this.fts.enabled || !this.fts.available) {
       return [];
     }
-    const sourceFilter = this.buildSourceFilter();
+    const sourceFilter = this.buildSourceFilter("c");
     // In FTS-only mode (no provider), search all models; otherwise filter by current provider's model
     const providerModel = this.provider?.model;
     const results = await searchKeyword({
@@ -506,6 +507,7 @@ export class MemoryIndexManager extends MemoryManagerEmbeddingOps implements Mem
       sourceFilter,
       buildFtsQuery: (raw) => this.buildFtsQuery(raw),
       bm25RankToScore,
+      agentId: this.agentId,
     });
     return results.map((entry) => entry as MemorySearchResult & { id: string; textScore: number });
   }
