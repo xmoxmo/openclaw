@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import type { OpenClawConfig, MemorySearchConfig } from "../config/config.js";
@@ -10,7 +11,7 @@ import {
 } from "../plugin-sdk/memory-core-host-multimodal.js";
 import { getMemoryEmbeddingProvider } from "../plugins/memory-embedding-providers.js";
 import { clampInt, clampNumber, resolveUserPath } from "../utils.js";
-import { resolveAgentConfig } from "./agent-scope.js";
+import { resolveAgentConfig, resolveAgentWorkspaceDir } from "./agent-scope.js";
 
 export type ResolvedMemorySearchConfig = {
   enabled: boolean;
@@ -40,6 +41,7 @@ export type ResolvedMemorySearchConfig = {
     modelPath?: string;
     modelCacheDir?: string;
   };
+  sharedStorePath: string;
   store: {
     driver: "sqlite";
     path: string;
@@ -327,6 +329,7 @@ function mergeConfig(
     outputDimensionality,
     local,
     store,
+    sharedStorePath: store.path,
     chunking: { tokens: Math.max(1, chunking.tokens), overlap },
     sync: {
       ...sync,
@@ -366,6 +369,24 @@ function mergeConfig(
   };
 }
 
+/**
+ * Compute a deterministic hash for a shared memory store scope.
+ *
+ * Agents with the same workspace directory and extraPaths share
+ * one physical SQLite store. The hash is used as the database filename.
+ */
+export function computeSharedScopeHash(workspaceDir: string, extraPaths: string[]): string {
+  const normalizedPaths = extraPaths
+    .map((p) => resolveUserPath(p))
+    .filter(Boolean)
+    .toSorted();
+  const input = JSON.stringify({
+    workspace: path.resolve(workspaceDir),
+    extraPaths: normalizedPaths,
+  });
+  return crypto.createHash("sha256").update(input).digest("hex").slice(0, 16);
+}
+
 export function resolveMemorySearchConfig(
   cfg: OpenClawConfig,
   agentId: string,
@@ -376,6 +397,18 @@ export function resolveMemorySearchConfig(
   if (!resolved.enabled) {
     return null;
   }
+
+  // Override store path to shared store by directory hash.
+  // All agents referencing the same workspace + extraPaths share one physical DB.
+  resolved.sharedStorePath = resolved.store.path;
+  if (resolved.sources.includes("memory")) {
+    const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
+    const scopeHash = computeSharedScopeHash(workspaceDir, resolved.extraPaths);
+    const stateDir = resolveStateDir(process.env, os.homedir);
+    resolved.sharedStorePath = path.join(stateDir, "memory", `shared-${scopeHash}.sqlite`);
+    resolved.store.path = resolved.sharedStorePath;
+  }
+
   const multimodalActive = isMemoryMultimodalEnabled(resolved.multimodal);
   const multimodalProvider =
     resolved.provider === "auto" ? undefined : getMemoryEmbeddingProvider(resolved.provider);

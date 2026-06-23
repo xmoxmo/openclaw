@@ -7,6 +7,7 @@ export {
   resolveSessionAgentId,
 } from "../../../src/agents/agent-scope.js";
 export {
+  computeSharedScopeHash,
   resolveMemorySearchConfig,
   type ResolvedMemorySearchConfig,
 } from "../../../src/agents/memory-search.js";
