@@ -376,10 +376,18 @@ function mergeConfig(
  * one physical SQLite store. The hash is used as the database filename.
  */
 export function computeSharedScopeHash(workspaceDir: string, extraPaths: string[]): string {
-  const normalizedPaths = extraPaths
-    .map((p) => resolveUserPath(p))
-    .filter(Boolean)
-    .toSorted();
+  const normalizedPaths = Array.from(
+    new Set(
+      extraPaths
+        .map((value) => value.trim())
+        .filter(Boolean)
+        .map((value) =>
+          path.isAbsolute(value)
+            ? path.resolve(resolveUserPath(value))
+            : path.resolve(workspaceDir, value),
+        ),
+    ),
+  ).toSorted();
   const input = JSON.stringify({
     workspace: path.resolve(workspaceDir),
     extraPaths: normalizedPaths,

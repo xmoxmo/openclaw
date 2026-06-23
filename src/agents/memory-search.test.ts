@@ -1,10 +1,12 @@
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import {
   clearMemoryEmbeddingProviders,
   registerMemoryEmbeddingProvider,
 } from "../plugins/memory-embedding-providers.js";
-import { resolveMemorySearchConfig } from "./memory-search.js";
+import { computeSharedScopeHash, resolveMemorySearchConfig } from "./memory-search.js";
 
 const asConfig = (cfg: OpenClawConfig): OpenClawConfig => cfg;
 
@@ -444,5 +446,82 @@ describe("memory search config", () => {
     });
     const resolved = resolveMemorySearchConfig(cfg, "main");
     expect(resolved?.sources).toContain("sessions");
+  });
+
+  it("shares one store for agents bound to the same resolved memory scope", () => {
+    const workspaceDir = path.join(os.tmpdir(), "memory-search-shared-workspace");
+    const cfg = asConfig({
+      agents: {
+        defaults: {
+          memorySearch: {
+            provider: "openai",
+            extraPaths: ["./docs"],
+          },
+        },
+        list: [
+          {
+            id: "main",
+            default: true,
+            workspace: workspaceDir,
+          },
+          {
+            id: "ops",
+            workspace: workspaceDir,
+            memorySearch: {
+              extraPaths: ["docs"],
+            },
+          },
+        ],
+      },
+    });
+
+    const mainResolved = resolveMemorySearchConfig(cfg, "main");
+    const opsResolved = resolveMemorySearchConfig(cfg, "ops");
+
+    expect(mainResolved?.store.path).toBe(opsResolved?.store.path);
+    expect(mainResolved?.store.path).toMatch(/shared-[0-9a-f]{16}\.sqlite$/);
+  });
+
+  it("uses different stores when relative extraPaths resolve to different real paths", () => {
+    const cfg = asConfig({
+      agents: {
+        defaults: {
+          memorySearch: {
+            provider: "openai",
+            extraPaths: ["docs"],
+          },
+        },
+        list: [
+          {
+            id: "main",
+            default: true,
+            workspace: "/tmp/workspace-a",
+          },
+          {
+            id: "ops",
+            workspace: "/tmp/workspace-b",
+          },
+        ],
+      },
+    });
+
+    const mainResolved = resolveMemorySearchConfig(cfg, "main");
+    const opsResolved = resolveMemorySearchConfig(cfg, "ops");
+
+    expect(mainResolved?.store.path).not.toBe(opsResolved?.store.path);
+    expect(computeSharedScopeHash("/tmp/workspace-a", ["docs"])).not.toBe(
+      computeSharedScopeHash("/tmp/workspace-b", ["docs"]),
+    );
+  });
+
+  it("normalizes absolute and workspace-relative extraPaths consistently for the shared hash", () => {
+    const workspaceDir = "/tmp/workspace-a";
+    const hashFromRelative = computeSharedScopeHash(workspaceDir, ["./docs", "notes/shared.md"]);
+    const hashFromAbsolute = computeSharedScopeHash(workspaceDir, [
+      "/tmp/workspace-a/docs",
+      "/tmp/workspace-a/notes/shared.md",
+    ]);
+
+    expect(hashFromRelative).toBe(hashFromAbsolute);
   });
 });
