@@ -509,19 +509,14 @@ describe("memory search config", () => {
     const opsResolved = resolveMemorySearchConfig(cfg, "ops");
 
     expect(mainResolved?.store.path).not.toBe(opsResolved?.store.path);
-    expect(computeSharedScopeHash("/tmp/workspace-a", ["docs"])).not.toBe(
-      computeSharedScopeHash("/tmp/workspace-b", ["docs"]),
+    expect(computeSharedScopeHash("/tmp/workspace-a")).not.toBe(
+      computeSharedScopeHash("/tmp/workspace-b"),
     );
   });
 
-  it("normalizes absolute and workspace-relative extraPaths consistently for the shared hash", () => {
-    const workspaceDir = "/tmp/workspace-a";
-    const hashFromRelative = computeSharedScopeHash(workspaceDir, ["./docs", "notes/shared.md"]);
-    const hashFromAbsolute = computeSharedScopeHash(workspaceDir, [
-      "/tmp/workspace-a/docs",
-      "/tmp/workspace-a/notes/shared.md",
-    ]);
-
-    expect(hashFromRelative).toBe(hashFromAbsolute);
+  it("same workspace always produces same hash regardless of extraPaths", () => {
+    const hashA = computeSharedScopeHash("/tmp/workspace-a");
+    const hashB = computeSharedScopeHash("/tmp/workspace-a");
+    expect(hashA).toBe(hashB);
   });
 });

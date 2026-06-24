@@ -372,25 +372,14 @@ function mergeConfig(
 /**
  * Compute a deterministic hash for a shared memory store scope.
  *
- * Agents with the same workspace directory and extraPaths share
+ * Agents sharing the same workspace directory share
  * one physical SQLite store. The hash is used as the database filename.
+ * extraPaths changes do not create a new store — the engine handles
+ * incremental indexing for new paths within the same scope.
  */
-export function computeSharedScopeHash(workspaceDir: string, extraPaths: string[]): string {
-  const normalizedPaths = Array.from(
-    new Set(
-      extraPaths
-        .map((value) => value.trim())
-        .filter(Boolean)
-        .map((value) =>
-          path.isAbsolute(value)
-            ? path.resolve(resolveUserPath(value))
-            : path.resolve(workspaceDir, value),
-        ),
-    ),
-  ).toSorted();
+export function computeSharedScopeHash(workspaceDir: string): string {
   const input = JSON.stringify({
     workspace: path.resolve(workspaceDir),
-    extraPaths: normalizedPaths,
   });
   return crypto.createHash("sha256").update(input).digest("hex").slice(0, 16);
 }
@@ -407,11 +396,12 @@ export function resolveMemorySearchConfig(
   }
 
   // Override store path to shared store by directory hash.
-  // All agents referencing the same workspace + extraPaths share one physical DB.
+  // All agents referencing the same workspace share one physical DB.
+  // extraPaths are excluded from hash — they are an index scope, not a store identity.
   resolved.sharedStorePath = resolved.store.path;
   if (resolved.sources.includes("memory")) {
     const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
-    const scopeHash = computeSharedScopeHash(workspaceDir, resolved.extraPaths);
+    const scopeHash = computeSharedScopeHash(workspaceDir);
     const stateDir = resolveStateDir(process.env, os.homedir);
     resolved.sharedStorePath = path.join(stateDir, "memory", `shared-${scopeHash}.sqlite`);
     resolved.store.path = resolved.sharedStorePath;
